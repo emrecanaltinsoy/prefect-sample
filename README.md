@@ -1,155 +1,187 @@
-# Prefect Sample: Two-Step Orders Pipeline (Docker + REST)
+# Prefect Sample: Orders Pipeline (Docker, REST, MinIO, Postgres)
 
-A [Prefect 3](https://docs.prefect.io/) orchestration where each step runs in its
-own Docker container and exposes a REST API. The Prefect flow calls the steps over HTTP.
+An orchestrated pipeline with Prefect 3 where:
+
+- an **orchestrator API** (FastAPI) accepts pipeline requests and queues them as Prefect flow runs,
+- a **Docker work pool** runs each flow run in its own container, at most **10 at a time**,
+- the flow calls two **step services** (FastAPI, one container each) over HTTP,
+- step outputs are stored in **MinIO** (S3), one folder per run,
+- Prefect's state and queue are stored in **PostgreSQL**.
 
 ```
-                       ┌──────────────────────────┐
-                       │  pipeline (Prefect flow)  │  flow.py
-                       └──────┬───────────────┬────┘
-              POST /run       │               │       POST /run
-                  ┌───────────▼──┐        ┌───▼──────────────┐
-                  │ extract-step │        │ transform-step   │
-                  │ :8001 → :8000│        │ :8002 → :8000    │
-                  └──────┬───────┘        └────────▲─────────┘
-                         │ writes orders.csv        │ reads orders.csv
-                         └────────► ./data ─────────┘ writes summary.json
-                                     ▲
-                       prefect-server (UI/API) :4200
+client ──POST /pipelines──▶ orchestrator-api (FastAPI, :8080)
+                                  │ create flow run (returns immediately)
+                                  ▼
+                            prefect-server (UI :4200) ── postgres
+                                  │ queued runs
+                                  ▼
+                            prefect-worker (--limit 10)
+                                  │ one container per flow run
+                                  ▼
+                    flow container (orders-pipeline)
+                          │ POST /run                 │ POST /run
+                          ▼                           ▼
+             extract-step (:8000, internal)  transform-step (:8000, internal)
+                          │ put runs/<id>/raw/orders.csv      ▲ get runs/<id>/raw/orders.csv
+                          └──────────────► minio (S3 :9000, console :9001) ─┘
+                                           put runs/<id>/processed/summary.json
 ```
 
-The flow runs two tasks in order: `call-extract-step`, then `call-transform-step`.
-The extract response contains the file path, and the flow passes it to the transform step.
+Each flow run's `run_id` is its Prefect flow run ID, so parallel runs never overwrite each other.
 
 ## Project layout
 
 ```
 .
-├── flow.py                    # Prefect flow: calls the step APIs over HTTP
-├── Dockerfile                 # Orchestrator image
-├── docker-compose.yml         # Prefect server + 2 step services + pipeline
-├── pyproject.toml / uv.lock   # Orchestrator dependencies (uv)
-├── packages/
-│   └── prefect-log-handler/   # Shared uv package: sends logs to the Prefect API
-│       ├── README.md
-│       ├── pyproject.toml
-│       └── src/prefect_log_handler/
+├── flow.py                    # Prefect flow: calls the step APIs (runs in the flow container)
+├── deploy.py                  # Registers the flow as a deployment on the Docker work pool
+├── Dockerfile                 # Flow image (also used by the deployer and the worker)
+├── infra/docker-job-template.json   # Work pool template: network, env, image, auto-remove
+├── docker-compose.yml         # Everything below, wired together
+├── orchestrator/              # Orchestrator API (FastAPI) - see its README
 ├── steps/
-│   ├── extract/               # Step 1 service
-│   │   ├── README.md
-│   │   ├── main.py            # FastAPI app: GET /health, POST /run
-│   │   ├── Dockerfile
-│   │   ├── pyproject.toml / uv.lock
-│   └── transform/             # Step 2 service
-│       ├── README.md
-│       ├── main.py            # FastAPI app: GET /health, POST /run
-│       ├── Dockerfile
-│       ├── pyproject.toml / uv.lock
-└── data/                      # Shared volume, created at runtime
-    ├── raw/orders.csv
-    └── processed/summary.json
+│   ├── extract/               # Step 1 service - see its README
+│   └── transform/             # Step 2 service - see its README
+├── packages/
+│   └── prefect-log-handler/   # Shared library: sends logs to the Prefect API
+├── samples/                   # Sample request payloads and a burst script
+├── pyproject.toml / uv.lock   # Flow and deployer dependencies (uv)
+└── .python-version            # 3.15
 ```
 
-Each step has its own `pyproject.toml` and `uv.lock`, so each image installs only the
-dependencies it needs. Both steps depend on the shared `packages/prefect-log-handler`
-library, so the step images are built from the repository root (`context: .` in
-`docker-compose.yml`) to include it.
+## Services
 
-## Run everything with Docker Compose
+| Service          | URL                          | Purpose                                                  |
+|------------------|------------------------------|----------------------------------------------------------|
+| orchestrator-api | http://localhost:8080/docs   | Start and check pipeline runs                            |
+| prefect-server   | http://localhost:4200        | Prefect UI and API                                       |
+| prefect-worker   | —                            | Starts a container per flow run (max 10 at once)         |
+| extract-step     | internal only                | Step 1 REST API (`http://extract-step:8000`)             |
+| transform-step   | internal only                | Step 2 REST API (`http://transform-step:8000`)           |
+| minio            | http://localhost:9001        | MinIO console (user and password from `.env`)            |
+| reaper           | —                            | Marks runs stuck in `Submitting` as Crashed              |
+| postgres         | —                            | Prefect database                                         |
+| deployer         | —                            | One-shot: creates the work pool and deployment, then exits |
 
-Requires Docker (Docker Desktop, or Docker Engine + Compose v2).
+## Requirements
+
+- Docker with Compose v2 (Docker Desktop, or Colima).
+- **Memory:** each flow run is a Python container of roughly 150 to 250 MB. With the limit at
+  10, plan for about 3 GB for flow runs plus about 1 GB for the services. On Colima, start it
+  with `colima start --memory 8 --cpu 4`. At 2 GB the Prefect server was killed by the OOM killer
+  during a burst.
+- For local development without Docker: [uv](https://docs.astral.sh/uv/). All projects use
+  **Python 3.15** (pinned in `.python-version`).
+
+## Run it
+
+Create your local settings first. `.env` holds the Postgres and MinIO credentials and is not committed:
 
 ```bash
-docker compose up --build
+cp .env.example .env     # then set real values for POSTGRES_PASSWORD, MINIO_ROOT_USER, MINIO_ROOT_PASSWORD
 ```
 
-Services:
+```bash
+docker compose up --build -d
+docker compose ps        # wait until the services are healthy
+```
 
-| Service          | URL                          | Purpose                          |
-|------------------|------------------------------|----------------------------------|
-| prefect-server   | http://localhost:4200        | Prefect UI and API               |
-| extract-step     | http://localhost:8001/docs   | Step 1 REST API (Swagger UI)     |
-| transform-step   | http://localhost:8002/docs   | Step 2 REST API (Swagger UI)     |
-| pipeline         | —                            | Runs the flow once, then exits   |
+If you change `POSTGRES_PASSWORD` after the first start, run `docker compose down -v` once, because
+Postgres only reads the password when its data volume is created.
 
-Open http://localhost:4200 to see the `orders-pipeline` run. Results are in `./data`.
+On startup, `deployer` creates the `docker-pool` work pool and the
+`orders-pipeline/orders-pipeline-docker` deployment, then exits. `prefect-worker` then
+starts polling the pool.
 
-Stop everything:
+Stop everything (data is kept in volumes):
 
 ```bash
 docker compose down
 ```
 
-## Call the steps directly with curl
-
-With the stack running:
+Remove the data as well:
 
 ```bash
-curl -X POST http://localhost:8001/run -H "Content-Type: application/json" \
-     -d '{"num_orders": 100, "seed": 42}'
-
-curl -X POST http://localhost:8002/run -H "Content-Type: application/json" \
-     -d '{"input_path": "/data/raw/orders.csv"}'
+docker compose down -v
 ```
 
-Note that the transform step sees the shared volume at `/data`, so the path is the
-container path, not `./data/...` on your machine.
+## Start a pipeline run
 
-## Run locally without Docker
-
-Requires [uv](https://docs.astral.sh/uv/getting-started/installation/). All projects use **Python 3.15** (pinned in `.python-version`); `uv` installs it for you. Use three terminals,
-all from the project root.
+Requests take a JSON body. Sample payloads are in [`samples/`](samples/).
 
 ```bash
-# Terminal 1: step 1 API
-DATA_DIR=$PWD/data uv run --project steps/extract uvicorn --app-dir steps/extract main:app --port 8001
-
-# Terminal 2: step 2 API
-DATA_DIR=$PWD/data uv run --project steps/transform uvicorn --app-dir steps/transform main:app --port 8002
-
-# Terminal 3: the orchestrator
-uv sync
-uv run python flow.py
+curl -X POST http://localhost:8080/pipelines \
+     -H "Content-Type: application/json" \
+     -d @samples/create-pipeline.json
 ```
 
-For step logs to appear in the Prefect UI, run a Prefect server and point everything at it:
+Response (`202 Accepted`). The run is queued, and the worker starts it when a slot is free:
+
+```json
+{
+  "flow_run_id": "2ff3ac16-0c6a-4f4d-a961-d4ceee49baa8",
+  "state": "Scheduled",
+  "ui_url": "http://localhost:4200/runs/flow-run/2ff3ac16-0c6a-4f4d-a961-d4ceee49baa8"
+}
+```
+
+Check the run:
 
 ```bash
-# Terminal 0: Prefect server (UI at http://localhost:4200)
-uv run prefect server start
-
-# In each terminal (1-3), before starting the process:
-export PREFECT_API_URL=http://localhost:4200/api
+curl http://localhost:8080/pipelines/<flow_run_id>
 ```
 
-Without `PREFECT_API_URL`, the orchestrator uses a temporary server and the steps only log to stdout.
-
-The flow defaults to `http://localhost:8001` and `http://localhost:8002`. Override them
-with `EXTRACT_URL` and `TRANSFORM_URL` if needed.
-
-## View logs in the Prefect UI
-
-Each step logs its work to the Prefect API as well as stdout. Logs from the orchestrator
-and from the steps appear together under the same flow run.
-
-1. Open http://localhost:4200 and go to **Runs**, then `orders-pipeline`.
-2. Open the run and select the **Logs** tab. You will see:
-   - `prefect.flow_runs` and `prefect.task_runs`: orchestrator messages
-   - `extract-step`: messages from step 1
-   - `transform-step`: messages from step 2
-
-The orchestrator passes its flow run ID and task run ID to each step in the request body.
-The steps tag their logs with those IDs, so each log line is attached to the correct task.
-
-Step logs also appear in the container output: `docker compose logs extract-step`.
-
-## Check the result
+Send an `Idempotency-Key` header to make retries safe. A second request with the same key returns
+the existing run instead of starting another one:
 
 ```bash
-cat data/processed/summary.json
+curl -X POST http://localhost:8080/pipelines \
+     -H "Content-Type: application/json" -H "Idempotency-Key: order-42" \
+     -d @samples/create-pipeline.json
 ```
 
-Example output (fixed seed, so it is the same on every run):
+Payloads:
+
+| File                                         | Body                  |
+|----------------------------------------------|-----------------------|
+| `samples/create-pipeline.json`               | `{"num_orders": 100}` |
+| `samples/create-pipeline-large.json`         | `{"num_orders": 5000}` |
+
+## Test parallel runs
+
+```bash
+./samples/burst.sh 25      # sends 25 requests as fast as possible
+```
+
+The orchestrator returns right away for each request. The worker runs at most 10 flow
+containers at once, and the rest wait in the queue. Watch them in the UI at
+http://localhost:4200, or check the worker log:
+
+```bash
+docker compose logs -f prefect-worker
+```
+
+Measured on this setup (Colima, 8 GB, 4 CPUs): 25 requests of 20,000 orders each. The host never ran more than 10 flow containers at once, and all 25 completed.
+
+## See the results
+
+Each run writes two objects to the `pipeline-data` bucket, under its run ID:
+
+```
+runs/<flow_run_id>/raw/orders.csv
+runs/<flow_run_id>/processed/summary.json
+```
+
+Open the MinIO console at http://localhost:9001 (user and password from `.env`) and browse bucket
+`pipeline-data`. To download an object from the command line, use any S3 client, for example the AWS CLI:
+
+```bash
+AWS_ACCESS_KEY_ID=$MINIO_ROOT_USER AWS_SECRET_ACCESS_KEY=$MINIO_ROOT_PASSWORD \
+  aws --endpoint-url http://localhost:9000 --region us-east-1 \
+  s3 cp s3://pipeline-data/runs/<flow_run_id>/processed/summary.json -
+```
+
+Example summary (the fixed seed gives the same output for 100 orders on every run):
 
 ```json
 {
@@ -165,7 +197,54 @@ Example output (fixed seed, so it is the same on every run):
 }
 ```
 
+## Tests and lint
+
+Each project has its own tests (run with uv from the project folder):
+
+```bash
+(cd steps/extract && uv run pytest)
+(cd steps/transform && uv run pytest)
+(cd orchestrator && uv run pytest)
+uv run pytest                              # flow-side tests (the reaper)
+```
+
+Lint and format, with the same ruff version as the pre-commit hooks:
+
+```bash
+uv tool run ruff@0.8.0 check .
+uv tool run ruff@0.8.0 format --check .
+```
+
+## View logs in the Prefect UI
+
+Each service sends its logs to the Prefect API as well as stdout, tagged with the flow run and
+task run. Open a run in the UI and select the **Logs** tab. You will see the orchestrator's
+messages, plus `extract-step` and `transform-step` messages, in one place.
+
+Container output: `docker compose logs extract-step`.
+
+## Local development without Docker
+
+Use this for working on the Python code. The orchestrator and flow still need the Prefect server,
+MinIO, and the work pool, so start the infrastructure with Compose and run the rest locally:
+
+```bash
+docker compose up -d postgres minio prefect-server
+set -a; . ./.env; set +a                       # load the MinIO credentials
+export PREFECT_API_URL=http://localhost:4200/api
+export S3_ENDPOINT_URL=http://localhost:9000
+export S3_ACCESS_KEY=$MINIO_ROOT_USER S3_SECRET_KEY=$MINIO_ROOT_PASSWORD
+
+uv run --project steps/extract uvicorn --app-dir steps/extract main:app --port 8001
+uv run --project steps/transform uvicorn --app-dir steps/transform main:app --port 8002
+uv run python flow.py      # runs the flow in this terminal, no worker needed
+```
+
+`flow.py` run this way uses the default step URLs (`localhost:8001` and `localhost:8002`), which match the local `uvicorn` ports above.
+
 ## More details
 
+- [Orchestrator API](orchestrator/README.md)
 - [Step 1: extract](steps/extract/README.md)
 - [Step 2: transform](steps/transform/README.md)
+- [prefect-log-handler](packages/prefect-log-handler/README.md)

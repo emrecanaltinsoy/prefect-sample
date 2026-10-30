@@ -2,37 +2,47 @@
 
 Endpoints:
   GET  /health  -> liveness check
-  POST /run     -> read a raw orders CSV, write a revenue summary JSON, return its path
+  POST /run     -> read runs/<run_id>/raw/orders.csv from MinIO, write
+                   runs/<run_id>/processed/summary.json, return the summary
 
-Logs go to stdout and to the Prefect API. If the caller passes flow_run_id and
-task_run_id, the logs appear under that run in the Prefect UI.
+Logs go to stdout and to the Prefect API, tagged with flow_run_id / task_run_id when given.
 """
 
 import csv
+import io
 import json
 import logging
 import os
 from collections import defaultdict
-from pathlib import Path
 
+import boto3
+from botocore.exceptions import ClientError
 from fastapi import FastAPI, HTTPException
 from prefect_log_handler import setup_logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "data")).resolve()
+S3_BUCKET = os.getenv("S3_BUCKET", "pipeline-data")
+S3 = boto3.client(
+    "s3",
+    endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://localhost:9000"),
+    aws_access_key_id=os.environ["S3_ACCESS_KEY"],
+    aws_secret_access_key=os.environ["S3_SECRET_KEY"],
+    region_name="us-east-1",
+)
 
 logger = setup_logger("transform-step")
-app = FastAPI(title="Transform step", version="1.0.0")
+app = FastAPI(title="Transform step", version="2.0.0")
 
 
 class TransformRequest(BaseModel):
-    input_path: str  # must live under DATA_DIR, e.g. /data/raw/orders.csv
+    run_id: str = Field(..., pattern=r"^[A-Za-z0-9_-]{1,64}$")
     flow_run_id: str | None = None  # set by the orchestrator, used to tag logs
     task_run_id: str | None = None
 
 
 class TransformResponse(BaseModel):
-    output_path: str
+    run_id: str
+    object_key: str
     order_count: int
     total_revenue: float
 
@@ -47,32 +57,26 @@ def run(req: TransformRequest) -> TransformResponse:
     log = logging.LoggerAdapter(
         logger, {"flow_run_id": req.flow_run_id, "task_run_id": req.task_run_id}
     )
-    input_path = Path(req.input_path).resolve()
+    in_key = f"runs/{req.run_id}/raw/orders.csv"
+    log.info("Run %s: reading s3://%s/%s", req.run_id, S3_BUCKET, in_key)
 
-    # Only allow reading files inside the shared data directory.
-    if not input_path.is_relative_to(DATA_DIR):
-        log.error("Rejected input_path outside data dir: %s", input_path)
-        raise HTTPException(
-            status_code=400, detail=f"input_path must be under {DATA_DIR}"
-        )
-    if not input_path.is_file():
-        log.error("Input file not found: %s", input_path)
-        raise HTTPException(
-            status_code=404, detail=f"input file not found: {input_path}"
-        )
+    try:
+        body = S3.get_object(Bucket=S3_BUCKET, Key=in_key)["Body"].read().decode()
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            log.error("Run %s: input not found: %s", req.run_id, in_key)
+            raise HTTPException(status_code=404, detail=f"input not found: {in_key}")
+        raise
 
-    log.info("Reading orders from %s", input_path)
     revenue_by_product: dict[str, float] = defaultdict(float)
     units_by_product: dict[str, int] = defaultdict(int)
     order_count = 0
-
-    with input_path.open(newline="") as f:
-        for row in csv.DictReader(f):
-            qty = int(row["quantity"])
-            price = float(row["unit_price"])
-            revenue_by_product[row["product"]] += qty * price
-            units_by_product[row["product"]] += qty
-            order_count += 1
+    for row in csv.DictReader(io.StringIO(body)):
+        qty = int(row["quantity"])
+        price = float(row["unit_price"])
+        revenue_by_product[row["product"]] += qty * price
+        units_by_product[row["product"]] += qty
+        order_count += 1
 
     total_revenue = round(sum(revenue_by_product.values()), 2)
     summary = {
@@ -86,20 +90,25 @@ def run(req: TransformRequest) -> TransformResponse:
         },
     }
 
-    output_dir = DATA_DIR / "processed"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / "summary.json"
-    output_path.write_text(json.dumps(summary, indent=2))
+    out_key = f"runs/{req.run_id}/processed/summary.json"
+    S3.put_object(
+        Bucket=S3_BUCKET,
+        Key=out_key,
+        Body=json.dumps(summary, indent=2).encode(),
+        ContentType="application/json",
+    )
 
     log.info(
-        "Aggregated %d orders across %d products, total revenue %.2f",
+        "Run %s: aggregated %d orders across %d products, total revenue %.2f",
+        req.run_id,
         order_count,
         len(revenue_by_product),
         total_revenue,
     )
-    log.info("Wrote summary to %s", output_path)
+    log.info("Run %s: wrote summary to s3://%s/%s", req.run_id, S3_BUCKET, out_key)
     return TransformResponse(
-        output_path=str(output_path),
+        run_id=req.run_id,
+        object_key=out_key,
         order_count=order_count,
         total_revenue=total_revenue,
     )

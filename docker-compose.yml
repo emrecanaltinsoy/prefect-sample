@@ -1,33 +1,129 @@
+# Services:
+#   postgres        Prefect database
+#   minio           S3-compatible object storage for step outputs
+#   prefect-server  Prefect API + UI (http://localhost:4200)
+#   deployer        one-shot: creates the Docker work pool and the orders-pipeline deployment
+#   prefect-worker  runs flow runs as containers, at most 10 at a time (--limit 10)
+#   extract-step    step 1 REST API (internal only, reached as http://extract-step:8000)
+#   transform-step  step 2 REST API (internal only, reached as http://transform-step:8000)
+#   orchestrator-api  FastAPI that queues pipeline runs (http://localhost:8080/docs)
+
+x-pipeline-image: &pipeline-image
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: prefect-test-pipeline:latest
+
+x-minio-creds: &minio-creds
+  S3_ENDPOINT_URL: http://minio:9000
+  S3_ACCESS_KEY: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+  S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+  S3_BUCKET: pipeline-data
+
+networks:
+  default:
+    name: orders-net   # the Docker worker attaches flow containers to this network
+
 services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: prefect
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: prefect
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U prefect -d prefect"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    # Bitnami's copy of MinIO (upstream MinIO no longer publishes community images anonymously).
+    image: bitnamilegacy/minio:latest
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      MINIO_DEFAULT_BUCKETS: pipeline-data   # created on startup
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO console (http://localhost:9001)
+    volumes:
+      - minio-data:/bitnami/minio/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
   prefect-server:
-    image: prefecthq/prefect:3-latest
+    image: prefecthq/prefect:3.9.0-python3.15   # same version as the Python client in uv.lock
     command: prefect server start --host 0.0.0.0
     environment:
-      # SQLite is single-writer. Wait longer for locks instead of failing with
-      # "database is locked" (Prefect defaults are 5s connect / 10s command).
-      PREFECT_API_DATABASE_CONNECTION_TIMEOUT: "30"
-      PREFECT_API_DATABASE_TIMEOUT: "30"
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://prefect:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/prefect
     ports:
-      - "4200:4200"   # Prefect UI + API on http://localhost:4200
+      - "4200:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health', timeout=2)"]
       interval: 5s
       timeout: 5s
-      retries: 20
+      retries: 30
+
+  deployer:
+    <<: *pipeline-image
+    command:
+      - sh
+      - -c
+      - >-
+        prefect work-pool create docker-pool --type docker
+        --base-job-template infra/docker-job-template.json --overwrite
+        && python deploy.py
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+    restart: "no"
+
+  prefect-worker:
+    <<: *pipeline-image
+    command: prefect worker start --pool docker-pool --type docker --limit 10
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # starts one container per flow run
+    depends_on:
+      deployer:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  reaper:
+    <<: *pipeline-image
+    command: python reaper.py
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+      STUCK_AFTER_SECONDS: "600"
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+    restart: unless-stopped
 
   extract-step:
     build:
       context: .
       dockerfile: steps/extract/Dockerfile
-    ports:
-      - "8001:8000"   # http://localhost:8001/docs
     environment:
+      <<: *minio-creds
       PREFECT_API_URL: http://prefect-server:4200/api   # step logs go to the Prefect UI
     depends_on:
+      minio:
+        condition: service_healthy
       prefect-server:
         condition: service_healthy
-    volumes:
-      - ./data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
       interval: 5s
@@ -38,33 +134,36 @@ services:
     build:
       context: .
       dockerfile: steps/transform/Dockerfile
-    ports:
-      - "8002:8000"   # http://localhost:8002/docs
     environment:
-      PREFECT_API_URL: http://prefect-server:4200/api   # step logs go to the Prefect UI
+      <<: *minio-creds
+      PREFECT_API_URL: http://prefect-server:4200/api
     depends_on:
+      minio:
+        condition: service_healthy
       prefect-server:
         condition: service_healthy
-    volumes:
-      - ./data:/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
       interval: 5s
       timeout: 5s
       retries: 20
 
-  pipeline:
-    build: .
-    depends_on:
-      prefect-server:
-        condition: service_healthy
-      extract-step:
-        condition: service_healthy
-      transform-step:
-        condition: service_healthy
+  orchestrator-api:
+    build: ./orchestrator
     environment:
       PREFECT_API_URL: http://prefect-server:4200/api
-      EXTRACT_URL: http://extract-step:8000
-      TRANSFORM_URL: http://transform-step:8000
-    volumes:
-      - ./data:/data
+      PREFECT_UI_URL: http://localhost:4200
+    ports:
+      - "8080:8000"
+    depends_on:
+      deployer:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  pg-data:
+  minio-data:

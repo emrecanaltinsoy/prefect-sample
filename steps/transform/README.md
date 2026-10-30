@@ -1,79 +1,86 @@
 # Step 2: Transform (REST service)
 
 **Code:** [`main.py`](main.py) · **Image:** built from [`Dockerfile`](Dockerfile)
-**Port:** `8000` in the container, `8002` on the host (Compose)
+**Port:** `8000` inside the Compose network (no host port; run locally on `8001`/`8002`)
 
 ## What it does
 
-Reads a raw orders CSV from the shared volume and writes a revenue summary:
+Reads the raw orders for a run from MinIO and writes a revenue summary:
+
+```
+reads   s3://pipeline-data/runs/<run_id>/raw/orders.csv
+writes  s3://pipeline-data/runs/<run_id>/processed/summary.json
+```
+
+The summary contains:
 
 - total number of orders
 - total revenue
 - units sold and revenue per product, sorted by revenue (highest first)
 
-Output goes to `/data/processed/summary.json`.
-
-For safety, `input_path` must be inside the data directory. Requests for other paths
-return `400`.
+Because the input is addressed by `run_id`, a request can only read that run's folder. Path
+tricks such as `../` are not possible: `run_id` is checked against a pattern (letters, digits,
+`-` and `_`).
 
 ## API
 
-| Method | Path      | Description                                         |
-|--------|-----------|-----------------------------------------------------|
-| GET    | `/health` | Liveness check, returns `{"status": "ok"}`         |
-| POST   | `/run`    | Read the CSV, write the summary, return its path    |
+| Method | Path      | Description                                              |
+|--------|-----------|----------------------------------------------------------|
+| GET    | `/health` | Liveness check, returns `{"status": "ok"}`              |
+| POST   | `/run`    | Read the run's orders from MinIO, write and return the summary |
 
-Interactive docs: http://localhost:8002/docs (with the stack running).
+Interactive docs when running locally (see below): `http://localhost:8001/docs` (extract) or `http://localhost:8002/docs` (transform).
 
 **Request** (`POST /run`):
 
 ```json
-{ "input_path": "/data/raw/orders.csv" }
+{ "run_id": "my-test-run" }
 ```
 
 **Response:**
 
 ```json
-{ "output_path": "/data/processed/summary.json", "order_count": 100, "total_revenue": 20220.0 }
+{
+  "run_id": "my-test-run",
+  "object_key": "runs/my-test-run/processed/summary.json",
+  "order_count": 100,
+  "total_revenue": 20220.0
+}
 ```
 
-Errors: `400` if the path is outside the data directory, `404` if the file does not exist.
+Errors: `404` if the run has no `raw/orders.csv` (run the extract step first), `422` if `run_id`
+has invalid characters.
+
+## Configuration
+
+Same as the extract step: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY` and `S3_SECRET_KEY` (both required, from `.env`), `S3_BUCKET`, and
+`PREFECT_API_URL`.
 
 ## Logs
 
-The service logs to stdout
-
-Logging uses the shared [`prefect-log-handler`](../../packages/prefect-log-handler/README.md) package.
-
- and sends each record to the Prefect API (`PREFECT_API_URL`).
-Records are tagged with the `flow_run_id` and `task_run_id` from the request, so they appear
-under that task in the Prefect UI. Logging is stdlib-only and sent in the background, so it
-does not slow requests. Without `PREFECT_API_URL`, logs only go to stdout.
-
-Typical messages: `Reading orders from ...`, `Aggregated N orders ...`, and `Wrote summary to ...`.
-Rejected or missing input files are logged at ERROR level.
+Logs go to stdout and to the Prefect API, tagged with the flow run and task run, using the shared
+[`prefect-log-handler`](../../packages/prefect-log-handler/README.md) package.
 
 ## Run
 
-Run step 1 first, because step 2 needs its output.
-
-With Docker Compose (from the project root):
+Run step 1 first, because step 2 needs its output. With Docker Compose (from the project root):
 
 ```bash
-docker compose up --build extract-step transform-step
-curl -X POST http://localhost:8001/run -H "Content-Type: application/json" -d '{}'
-curl -X POST http://localhost:8002/run -H "Content-Type: application/json" \
-     -d '{"input_path": "/data/raw/orders.csv"}'
+docker compose up --build -d extract-step transform-step
+docker compose exec -T extract-step python -c "import urllib.request as u; r = u.Request('http://localhost:8000/run', data=b'{\"run_id\": \"manual-1\"}', headers={'Content-Type': 'application/json'}); print(u.urlopen(r).read().decode())"
+docker compose exec -T transform-step python -c "import urllib.request as u; r = u.Request('http://localhost:8000/run', data=b'{\"run_id\": \"manual-1\"}', headers={'Content-Type': 'application/json'}); print(u.urlopen(r).read().decode())"
 ```
 
-Locally (from the project root, with step 1 running on port 8001):
+Locally (from the project root, with MinIO on port 9000 and step 1 running on port 8001):
 
 ```bash
-DATA_DIR=$PWD/data uv run --project steps/transform uvicorn --app-dir steps/transform main:app --port 8002
-curl -X POST http://localhost:8002/run -H "Content-Type: application/json" \
-     -d "{\"input_path\": \"$PWD/data/raw/orders.csv\"}"
+docker compose up -d minio
+S3_ENDPOINT_URL=http://localhost:9000 S3_ACCESS_KEY=... S3_SECRET_KEY=... uv run --project steps/transform \
+  uvicorn --app-dir steps/transform main:app --port 8002
+curl -X POST http://localhost:8001/run -H "Content-Type: application/json" -d '{"run_id": "manual-1"}'
+curl -X POST http://localhost:8002/run -H "Content-Type: application/json" -d '{"run_id": "manual-1"}'
 ```
 
 ## Previous step
 
-[Step 1: extract](../extract/README.md) creates the input file.
+[Step 1: extract](../extract/README.md) creates the input object.
