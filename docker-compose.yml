@@ -1,0 +1,70 @@
+services:
+  prefect-server:
+    image: prefecthq/prefect:3-latest
+    command: prefect server start --host 0.0.0.0
+    environment:
+      # SQLite is single-writer. Wait longer for locks instead of failing with
+      # "database is locked" (Prefect defaults are 5s connect / 10s command).
+      PREFECT_API_DATABASE_CONNECTION_TIMEOUT: "30"
+      PREFECT_API_DATABASE_TIMEOUT: "30"
+    ports:
+      - "4200:4200"   # Prefect UI + API on http://localhost:4200
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4200/api/health', timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  extract-step:
+    build:
+      context: .
+      dockerfile: steps/extract/Dockerfile
+    ports:
+      - "8001:8000"   # http://localhost:8001/docs
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api   # step logs go to the Prefect UI
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  transform-step:
+    build:
+      context: .
+      dockerfile: steps/transform/Dockerfile
+    ports:
+      - "8002:8000"   # http://localhost:8002/docs
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api   # step logs go to the Prefect UI
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  pipeline:
+    build: .
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+      extract-step:
+        condition: service_healthy
+      transform-step:
+        condition: service_healthy
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
+      EXTRACT_URL: http://extract-step:8000
+      TRANSFORM_URL: http://transform-step:8000
+    volumes:
+      - ./data:/data
